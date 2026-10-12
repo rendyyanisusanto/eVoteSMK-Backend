@@ -1,12 +1,13 @@
+require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
 const multer = require('multer');
-const bcrypt = require('bcrypt');
+const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { v4: uuidv4 } = require('uuid');
 
-const db = require('./database');
+const pool = require('./database');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -64,17 +65,18 @@ const verifyToken = (req, res, next) => {
 // API Routes
 
 // GET - Ambil semua kandidat
-app.get('/api/candidates', (req, res) => {
-  db.all('SELECT id, nama, kelas, foto FROM candidates ORDER BY nama', (err, rows) => {
-    if (err) {
-      return res.status(500).json({ error: 'Database error' });
-    }
+app.get('/api/candidates', async (req, res) => {
+  try {
+    const [rows] = await pool.query('SELECT id, nama, kelas, foto FROM candidates ORDER BY nama');
     res.json(rows);
-  });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Database error' });
+  }
 });
 
 // GET - Ambil hasil voting (publik, tanpa auth)
-app.get('/api/results', (req, res) => {
+app.get('/api/results', async (req, res) => {
   const query = `
     SELECT 
       c.id, c.nama, c.kelas, c.foto,
@@ -85,125 +87,114 @@ app.get('/api/results', (req, res) => {
     ORDER BY vote_count DESC, c.nama
   `;
 
-  db.all(query, (err, results) => {
-    if (err) {
-      return res.status(500).json({ error: 'Database error' });
-    }
+  try {
+    const [results] = await pool.query(query);
     res.json(results);
-  });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Database error' });
+  }
 });
 
 // POST - Validasi kode voting
-app.post('/api/validate-code', (req, res) => {
+app.post('/api/validate-code', async (req, res) => {
   const { votingCode } = req.body;
 
   if (!votingCode) {
     return res.status(400).json({ error: 'Kode voting diperlukan' });
   }
 
-  // Cek apakah kode voting valid dan belum digunakan
-  db.get('SELECT * FROM voting_codes WHERE kode = ? AND is_used = 0', [votingCode], (err, code) => {
-    if (err) {
-      return res.status(500).json({ error: 'Database error' });
-    }
+  try {
+    const [rows] = await pool.query('SELECT * FROM voting_codes WHERE kode = ? AND is_used = 0', [votingCode]);
+    const code = rows[0];
 
     if (!code) {
       return res.status(400).json({ error: 'Kode voting tidak valid atau sudah digunakan' });
     }
 
     res.json({ valid: true, message: 'Kode voting valid' });
-  });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Database error' });
+  }
 });
 
 // POST - Vote dengan kode unik
-app.post('/api/vote', (req, res) => {
+app.post('/api/vote', async (req, res) => {
   const { votingCode, candidateId } = req.body;
 
   if (!votingCode || !candidateId) {
     return res.status(400).json({ error: 'Kode voting dan candidate ID diperlukan' });
   }
 
-  // Cek apakah kode voting valid dan belum digunakan
-  db.get('SELECT * FROM voting_codes WHERE kode = ? AND is_used = 0', [votingCode], (err, code) => {
-    if (err) {
-      return res.status(500).json({ error: 'Database error' });
-    }
+  let connection;
+  try {
+    connection = await pool.getConnection();
+    await connection.beginTransaction();
+
+    const [codeRows] = await connection.query('SELECT * FROM voting_codes WHERE kode = ? AND is_used = 0 FOR UPDATE', [votingCode]);
+    const code = codeRows[0];
 
     if (!code) {
+      await connection.rollback();
       return res.status(400).json({ error: 'Kode voting tidak valid atau sudah digunakan' });
     }
 
-    // Cek apakah kandidat ada
-    db.get('SELECT * FROM candidates WHERE id = ?', [candidateId], (err, candidate) => {
-      if (err) {
-        return res.status(500).json({ error: 'Database error' });
-      }
+    const [candidateRows] = await connection.query('SELECT * FROM candidates WHERE id = ?', [candidateId]);
+    const candidate = candidateRows[0];
 
-      if (!candidate) {
-        return res.status(400).json({ error: 'Kandidat tidak ditemukan' });
-      }
+    if (!candidate) {
+      await connection.rollback();
+      return res.status(400).json({ error: 'Kandidat tidak ditemukan' });
+    }
 
-      // Insert vote dan update kode voting
-      db.serialize(() => {
-        db.run('BEGIN TRANSACTION');
-        
-        db.run('INSERT INTO votes (candidate_id, voting_code_id) VALUES (?, ?)', 
-          [candidateId, code.id], (err) => {
-            if (err) {
-              db.run('ROLLBACK');
-              return res.status(500).json({ error: 'Gagal menyimpan vote' });
-            }
+    await connection.query('INSERT INTO votes (candidate_id, voting_code_id) VALUES (?, ?)', [candidateId, code.id]);
+    await connection.query('UPDATE voting_codes SET is_used = 1 WHERE id = ?', [code.id]);
 
-            db.run('UPDATE voting_codes SET is_used = 1 WHERE id = ?', [code.id], (err) => {
-              if (err) {
-                db.run('ROLLBACK');
-                return res.status(500).json({ error: 'Gagal update kode voting' });
-              }
-
-              db.run('COMMIT');
-              res.json({ message: 'Vote berhasil disimpan', candidate: candidate.nama });
-            });
-          });
-      });
-    });
-  });
+    await connection.commit();
+    res.json({ message: 'Vote berhasil disimpan', candidate: candidate.nama });
+  } catch (error) {
+    console.error(error);
+    if (connection) await connection.rollback();
+    res.status(500).json({ error: 'Gagal menyimpan vote' });
+  } finally {
+    if (connection) connection.release();
+  }
 });
 
 // POST - Admin login
-app.post('/api/admin/login', (req, res) => {
+app.post('/api/admin/login', async (req, res) => {
   const { username, password } = req.body;
 
   if (!username || !password) {
     return res.status(400).json({ error: 'Username dan password diperlukan' });
   }
 
-  db.get('SELECT * FROM admins WHERE username = ?', [username], async (err, admin) => {
-    if (err) {
-      return res.status(500).json({ error: 'Database error' });
-    }
+  try {
+    const [rows] = await pool.query('SELECT * FROM admins WHERE username = ?', [username]);
+    const admin = rows[0];
 
     if (!admin) {
       return res.status(401).json({ error: 'Username atau password salah' });
     }
 
-    try {
-      const isValid = await bcrypt.compare(password, admin.password);
-      if (!isValid) {
-        return res.status(401).json({ error: 'Username atau password salah' });
-      }
-
-      const token = jwt.sign({ id: admin.id, username: admin.username }, JWT_SECRET, { expiresIn: '24h' });
-      res.json({ token, admin: { id: admin.id, username: admin.username } });
-    } catch (error) {
-      res.status(500).json({ error: 'Error validating password' });
+    const isValid = await bcrypt.compare(password, admin.password);
+    if (!isValid) {
+      return res.status(401).json({ error: 'Username atau password salah' });
     }
-  });
+
+    const token = jwt.sign({ id: admin.id, username: admin.username }, JWT_SECRET, { expiresIn: '24h' });
+    res.json({ token, admin: { id: admin.id, username: admin.username } });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Error validating password' });
+  }
 });
 
 // Admin Routes (Protected)
 
 // GET - Ambil hasil voting
-app.get('/api/admin/results', verifyToken, (req, res) => {
+app.get('/api/admin/results', verifyToken, async (req, res) => {
   const query = `
     SELECT 
       c.id, c.nama, c.kelas, c.foto,
@@ -214,16 +205,17 @@ app.get('/api/admin/results', verifyToken, (req, res) => {
     ORDER BY vote_count DESC, c.nama
   `;
 
-  db.all(query, (err, results) => {
-    if (err) {
-      return res.status(500).json({ error: 'Database error' });
-    }
+  try {
+    const [results] = await pool.query(query);
     res.json(results);
-  });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Database error' });
+  }
 });
 
 // POST - Tambah kandidat
-app.post('/api/admin/candidates', verifyToken, upload.single('foto'), (req, res) => {
+app.post('/api/admin/candidates', verifyToken, upload.single('foto'), async (req, res) => {
   const { nama, kelas } = req.body;
   const foto = req.file ? req.file.filename : null;
 
@@ -231,23 +223,23 @@ app.post('/api/admin/candidates', verifyToken, upload.single('foto'), (req, res)
     return res.status(400).json({ error: 'Nama dan kelas diperlukan' });
   }
 
-  db.run('INSERT INTO candidates (nama, kelas, foto) VALUES (?, ?, ?)', 
-    [nama, kelas, foto], function(err) {
-      if (err) {
-        return res.status(500).json({ error: 'Gagal menambah kandidat' });
-      }
-      res.json({ 
-        id: this.lastID, 
-        nama, 
-        kelas, 
-        foto,
-        message: 'Kandidat berhasil ditambahkan' 
-      });
+  try {
+    const [result] = await pool.query('INSERT INTO candidates (nama, kelas, foto) VALUES (?, ?, ?)', [nama, kelas, foto]);
+    res.json({ 
+      id: result.insertId, 
+      nama, 
+      kelas, 
+      foto,
+      message: 'Kandidat berhasil ditambahkan' 
     });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Gagal menambah kandidat' });
+  }
 });
 
 // PUT - Update kandidat
-app.put('/api/admin/candidates/:id', verifyToken, upload.single('foto'), (req, res) => {
+app.put('/api/admin/candidates/:id', verifyToken, upload.single('foto'), async (req, res) => {
   const { id } = req.params;
   const { nama, kelas } = req.body;
   const foto = req.file ? req.file.filename : null;
@@ -265,30 +257,32 @@ app.put('/api/admin/candidates/:id', verifyToken, upload.single('foto'), (req, r
     params = [nama, kelas, id];
   }
 
-  db.run(query, params, function(err) {
-    if (err) {
-      return res.status(500).json({ error: 'Gagal update kandidat' });
-    }
-    if (this.changes === 0) {
+  try {
+    const [result] = await pool.query(query, params);
+    if (result.affectedRows === 0) {
       return res.status(404).json({ error: 'Kandidat tidak ditemukan' });
     }
     res.json({ message: 'Kandidat berhasil diupdate' });
-  });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Gagal update kandidat' });
+  }
 });
 
 // DELETE - Hapus kandidat
-app.delete('/api/admin/candidates/:id', verifyToken, (req, res) => {
+app.delete('/api/admin/candidates/:id', verifyToken, async (req, res) => {
   const { id } = req.params;
 
-  db.run('DELETE FROM candidates WHERE id = ?', [id], function(err) {
-    if (err) {
-      return res.status(500).json({ error: 'Gagal hapus kandidat' });
-    }
-    if (this.changes === 0) {
+  try {
+    const [result] = await pool.query('DELETE FROM candidates WHERE id = ?', [id]);
+    if (result.affectedRows === 0) {
       return res.status(404).json({ error: 'Kandidat tidak ditemukan' });
     }
     res.json({ message: 'Kandidat berhasil dihapus' });
-  });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Gagal hapus kandidat' });
+  }
 });
 
 // POST - Generate kode voting
@@ -300,115 +294,99 @@ app.post('/api/admin/voting-codes', verifyToken, async (req, res) => {
   }
   
   const codes = [];
-
   for (let i = 0; i < count; i++) {
     codes.push(uuidv4().substring(0, 8).toUpperCase());
   }
 
+  let connection;
   try {
-    // Insert codes one by one with error handling
-    const insertPromises = codes.map(code => {
-      return new Promise((resolve, reject) => {
-        db.run('INSERT INTO voting_codes (kode) VALUES (?)', [code], function(err) {
-          if (err) {
-            reject(err);
-          } else {
-            resolve(this.lastID);
-          }
-        });
-      });
-    });
+    connection = await pool.getConnection();
+    await connection.beginTransaction();
 
-    await Promise.all(insertPromises);
-    res.json({ codes, message: `${count} kode voting berhasil digenerate` });
+    const values = codes.map(code => [code]);
+    await connection.query('INSERT INTO voting_codes (kode) VALUES ?', [values]);
     
+    await connection.commit();
+    res.json({ codes, message: `${count} kode voting berhasil digenerate` });
   } catch (error) {
     console.error('Error generating voting codes:', error);
+    if (connection) await connection.rollback();
     res.status(500).json({ error: 'Gagal generate kode voting: ' + error.message });
+  } finally {
+    if (connection) connection.release();
   }
 });
 
 // GET - Ambil semua kode voting
-app.get('/api/admin/voting-codes', verifyToken, (req, res) => {
-  db.all('SELECT * FROM voting_codes ORDER BY created_at DESC', (err, codes) => {
-    if (err) {
-      return res.status(500).json({ error: 'Database error' });
-    }
+app.get('/api/admin/voting-codes', verifyToken, async (req, res) => {
+  try {
+    const [codes] = await pool.query('SELECT * FROM voting_codes ORDER BY created_at DESC');
     res.json(codes);
-  });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Database error' });
+  }
 });
 
 // DELETE - Reset semua kode voting
-app.delete('/api/admin/voting-codes/reset', verifyToken, (req, res) => {
-  db.serialize(() => {
-    db.run('BEGIN TRANSACTION');
+app.delete('/api/admin/voting-codes/reset', verifyToken, async (req, res) => {
+  let connection;
+  try {
+    connection = await pool.getConnection();
+    await connection.beginTransaction();
     
     // Delete all votes first (foreign key constraint)
-    db.run('DELETE FROM votes', (err) => {
-      if (err) {
-        db.run('ROLLBACK');
-        return res.status(500).json({ error: 'Gagal menghapus votes' });
-      }
-      
-      // Then delete all voting codes
-      db.run('DELETE FROM voting_codes', function(err) {
-        if (err) {
-          db.run('ROLLBACK');
-          return res.status(500).json({ error: 'Gagal reset kode voting' });
-        }
-        
-        db.run('COMMIT', (err) => {
-          if (err) {
-            return res.status(500).json({ error: 'Gagal commit transaction' });
-          }
-          res.json({ 
-            message: `${this.changes} kode voting berhasil direset`,
-            deletedCodes: this.changes 
-          });
-        });
-      });
+    await connection.query('DELETE FROM votes');
+    
+    // Then delete all voting codes
+    const [result] = await connection.query('DELETE FROM voting_codes');
+    
+    await connection.commit();
+    res.json({ 
+      message: `${result.affectedRows} kode voting berhasil direset`,
+      deletedCodes: result.affectedRows 
     });
-  });
+  } catch (error) {
+    console.error(error);
+    if (connection) await connection.rollback();
+    res.status(500).json({ error: 'Gagal reset kode voting' });
+  } finally {
+    if (connection) connection.release();
+  }
 });
 
 // PUT - Reset individual kode voting
-app.put('/api/admin/voting-codes/:id/reset', verifyToken, (req, res) => {
+app.put('/api/admin/voting-codes/:id/reset', verifyToken, async (req, res) => {
   const { id } = req.params;
 
-  db.serialize(() => {
-    db.run('BEGIN TRANSACTION');
+  let connection;
+  try {
+    connection = await pool.getConnection();
+    await connection.beginTransaction();
     
     // Delete votes for this specific code first
-    db.run('DELETE FROM votes WHERE voting_code_id = ?', [id], (err) => {
-      if (err) {
-        db.run('ROLLBACK');
-        return res.status(500).json({ error: 'Gagal menghapus vote terkait' });
-      }
-      
-      // Then reset the voting code status
-      db.run('UPDATE voting_codes SET is_used = 0, used_at = NULL WHERE id = ?', [id], function(err) {
-        if (err) {
-          db.run('ROLLBACK');
-          return res.status(500).json({ error: 'Gagal reset kode voting' });
-        }
-        
-        if (this.changes === 0) {
-          db.run('ROLLBACK');
-          return res.status(404).json({ error: 'Kode voting tidak ditemukan' });
-        }
-        
-        db.run('COMMIT', (err) => {
-          if (err) {
-            return res.status(500).json({ error: 'Gagal commit transaction' });
-          }
-          res.json({ 
-            message: 'Kode voting berhasil direset',
-            resetCode: id 
-          });
-        });
-      });
+    await connection.query('DELETE FROM votes WHERE voting_code_id = ?', [id]);
+    
+    // Then reset the voting code status
+    const [result] = await connection.query('UPDATE voting_codes SET is_used = 0, used_at = NULL WHERE id = ?', [id]);
+    
+    if (result.affectedRows === 0) {
+      await connection.rollback();
+      return res.status(404).json({ error: 'Kode voting tidak ditemukan' });
+    }
+    
+    await connection.commit();
+    res.json({ 
+      message: 'Kode voting berhasil direset',
+      resetCode: id 
     });
-  });
+  } catch (error) {
+    console.error(error);
+    if (connection) await connection.rollback();
+    res.status(500).json({ error: 'Gagal reset kode voting' });
+  } finally {
+    if (connection) connection.release();
+  }
 });
 
 // Error handling middleware

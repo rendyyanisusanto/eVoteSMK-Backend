@@ -1,77 +1,86 @@
-const sqlite3 = require('sqlite3').verbose();
-const bcrypt = require('bcrypt');
-const path = require('path');
+const mysql = require('mysql2/promise');
+const bcrypt = require('bcryptjs');
+require('dotenv').config();
 
-const dbPath = path.join(__dirname, 'voting.db');
-const db = new sqlite3.Database(dbPath);
-
-// Initialize database
-db.serialize(() => {
-  // Tabel kandidat
-  db.run(`CREATE TABLE IF NOT EXISTS candidates (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    nama TEXT NOT NULL,
-    kelas TEXT NOT NULL,
-    foto TEXT,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  )`);
-
-  // Tabel kode voting
-  db.run(`CREATE TABLE IF NOT EXISTS voting_codes (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    kode TEXT UNIQUE NOT NULL,
-    is_used BOOLEAN DEFAULT 0,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    used_at DATETIME
-  )`);
-
-  // Tabel votes
-  db.run(`CREATE TABLE IF NOT EXISTS votes (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    candidate_id INTEGER NOT NULL,
-    voting_code_id INTEGER NOT NULL,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (candidate_id) REFERENCES candidates (id),
-    FOREIGN KEY (voting_code_id) REFERENCES voting_codes (id)
-  )`);
-
-  // Tabel admin
-  db.run(`CREATE TABLE IF NOT EXISTS admins (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    username TEXT UNIQUE NOT NULL,
-    password TEXT NOT NULL,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  )`);
-
-  // Insert default admin (username: admin, password: admin123)
-  const defaultPassword = 'admin123';
-  bcrypt.hash(defaultPassword, 10, (err, hash) => {
-    if (err) {
-      console.error('Error hashing password:', err);
-      return;
-    }
-
-    db.run(
-      'INSERT OR IGNORE INTO admins (username, password) VALUES (?, ?)',
-      ['admin', hash],
-      function(err) {
-        if (err) {
-          console.error('Error creating default admin:', err);
-        } else if (this.changes > 0) {
-          console.log('Default admin created: username=admin, password=admin123');
-        }
-      }
-    );
-  });
-
+const pool = mysql.createPool({
+  host: process.env.DB_HOST || 'localhost',
+  user: process.env.DB_USER || 'root',
+  password: process.env.DB_PASSWORD || '',
+  database: process.env.DB_NAME || 'evoting',
+  waitForConnections: true,
+  connectionLimit: 10,
+  queueLimit: 0
 });
 
-// Update used_at when voting code is used
-db.run(`CREATE TRIGGER IF NOT EXISTS update_used_at 
-  AFTER UPDATE OF is_used ON voting_codes 
-  WHEN NEW.is_used = 1 AND OLD.is_used = 0
-  BEGIN
-    UPDATE voting_codes SET used_at = CURRENT_TIMESTAMP WHERE id = NEW.id;
-  END`);
+async function initDB() {
+  try {
+    // Tabel kandidat
+    await pool.query(`CREATE TABLE IF NOT EXISTS candidates (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      nama VARCHAR(255) NOT NULL,
+      kelas VARCHAR(255) NOT NULL,
+      foto VARCHAR(255),
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`);
 
-module.exports = db;
+    // Tabel kode voting
+    await pool.query(`CREATE TABLE IF NOT EXISTS voting_codes (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      kode VARCHAR(50) UNIQUE NOT NULL,
+      is_used BOOLEAN DEFAULT 0,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      used_at DATETIME
+    )`);
+
+    // Tabel votes
+    await pool.query(`CREATE TABLE IF NOT EXISTS votes (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      candidate_id INT NOT NULL,
+      voting_code_id INT NOT NULL,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (candidate_id) REFERENCES candidates (id),
+      FOREIGN KEY (voting_code_id) REFERENCES voting_codes (id)
+    )`);
+
+    // Tabel admin
+    await pool.query(`CREATE TABLE IF NOT EXISTS admins (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      username VARCHAR(255) UNIQUE NOT NULL,
+      password VARCHAR(255) NOT NULL,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`);
+
+    // Insert default admin (username: admin, password: admin123)
+    const [admins] = await pool.query('SELECT * FROM admins WHERE username = ?', ['admin']);
+    if (admins.length === 0) {
+      const defaultPassword = 'admin123';
+      const hash = await bcrypt.hash(defaultPassword, 10);
+      await pool.query(
+        'INSERT INTO admins (username, password) VALUES (?, ?)',
+        ['admin', hash]
+      );
+      console.log('Default admin created: username=admin, password=admin123');
+    }
+
+    // Buat Trigger untuk update used_at
+    await pool.query('DROP TRIGGER IF EXISTS update_used_at');
+    await pool.query(`
+      CREATE TRIGGER update_used_at 
+      BEFORE UPDATE ON voting_codes 
+      FOR EACH ROW
+      BEGIN
+        IF NEW.is_used = 1 AND OLD.is_used = 0 THEN
+          SET NEW.used_at = CURRENT_TIMESTAMP;
+        END IF;
+      END
+    `);
+
+    console.log('Database MySQL terhubung dan tabel berhasil diinisialisasi.');
+  } catch (error) {
+    console.error('Database initialization error:', error);
+  }
+}
+
+initDB();
+
+module.exports = pool;
